@@ -962,13 +962,22 @@ function getTeamMemberCount(chatId, slug) {
 const TEAM_ADD_PAGE_SIZE = 8;
 const TEAM_REM_PAGE_SIZE = 8;
 
-async function sendMentionChunks(ctx, chatId, targetMessageId, members) {
+function teamLabelForMessage(slug) {
+  if (!slug) return "Все";
+  const s = String(slug);
+  return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+}
+
+async function sendMentionChunks(ctx, chatId, targetMessageId, members, teamSlug = null) {
+  const label = teamLabelForMessage(teamSlug);
+  const suffix = `\n${escapeHtml(label)}, для вас важное сообщение!`;
   const chunks = [];
   for (let i = 0; i < members.length; i += CHUNK) {
     chunks.push(members.slice(i, i + CHUNK));
   }
   for (let i = 0; i < chunks.length; i++) {
-    const text = chunks[i].map(mentionHtml).join(MENTION_SEPARATOR);
+    const mentions = chunks[i].map(mentionHtml).join(MENTION_SEPARATOR);
+    const text = mentions + suffix;
     try {
       await ctx.telegram.sendMessage(chatId, text, {
         parse_mode: "HTML",
@@ -1023,7 +1032,7 @@ bot.command("tagall", async (ctx) => {
     const targetMessageId = replied.message_id;
     setCooldown(chatId);
     console.log(`tagall chat=${chatId} members=${members.length} chunks=${Math.ceil(members.length / CHUNK)}`);
-    await sendMentionChunks(ctx, chatId, targetMessageId, members);
+    await sendMentionChunks(ctx, chatId, targetMessageId, members, null);
   } catch (e) {
     console.error("tagall error:", e?.stack || e);
     return ctx.reply("❌ Ошибка при выполнении /tagall. Посмотри логи бота.");
@@ -1068,7 +1077,7 @@ bot.on("message", async (ctx, next) => {
       return;
     }
     setCooldown(chatId);
-    await sendMentionChunks(ctx, ctx.chat.id, replied.message_id, members);
+    await sendMentionChunks(ctx, ctx.chat.id, replied.message_id, members, cmd);
   } catch (e) {
     console.error(`team tag /${cmd} error:`, e?.stack || e);
     await ctx.reply("❌ Ошибка. Посмотри логи бота.").catch(() => {});
