@@ -132,6 +132,21 @@ const selectTeamMembersForRemovalStmt = db.prepare(`
   WHERE t.chat_id = ? AND t.slug = ?
   ORDER BY m.first_seen ASC
 `);
+const updateTeamSlugStmt = db.prepare(`
+  UPDATE chat_teams SET slug = ? WHERE chat_id = ? AND slug = ?
+`);
+const updateTeamMembersSlugStmt = db.prepare(`
+  UPDATE chat_team_members SET slug = ? WHERE chat_id = ? AND slug = ?
+`);
+const deleteTeamAllMembersStmt = db.prepare(`
+  DELETE FROM chat_team_members WHERE chat_id = ? AND slug = ?
+`);
+const deleteTeamStmt = db.prepare(`
+  DELETE FROM chat_teams WHERE chat_id = ? AND slug = ?
+`);
+
+// Admin menu: state for text input (create team name, rename team)
+const adminInputState = new Map(); // userId -> { chatId, step: 'new_team_slug' | 'rename_team', slug? }
 
 // -------------------- Cooldown --------------------
 const tagallLastRun = new Map();
@@ -200,6 +215,15 @@ async function isAdmin(ctx, userId) {
   }
 }
 
+async function isAdminInChat(ctx, chatId, userId) {
+  try {
+    const member = await ctx.telegram.getChatMember(chatId, userId);
+    return member?.status === "administrator" || member?.status === "creator";
+  } catch (e) {
+    return false;
+  }
+}
+
 function storeUser(chatId, user) {
   if (!chatId || !user || !user.id) return;
   upsertMemberStmt.run({
@@ -217,6 +241,65 @@ function storeUser(chatId, user) {
 bot.on("message", async (ctx, next) => {
   if (ctx.from && ctx.chat?.id) {
     storeUser(ctx.chat.id, ctx.from);
+  }
+  const state = adminInputState.get(ctx.from.id);
+  if (state && (state.step === "new_team_slug" || state.step === "rename_team") && ctx.message?.text) {
+    const text = ctx.message.text.trim();
+    const cid = state.chatId;
+    const isPrivate = ctx.chat.type === "private";
+    if (state.step === "new_team_slug") {
+      if (!text || text.length > SLUG_MAX_LEN || !SLUG_REGEX.test(text)) {
+        await ctx.reply("Неверный формат. Только латиница, цифры и _ до 32 символов.");
+        return;
+      }
+      if (getTeamStmt.get(cid, text)) {
+        await ctx.reply(`Команда /${text} уже есть.`);
+        return;
+      }
+      insertTeamStmt.run(cid, text);
+      adminInputState.delete(ctx.from.id);
+      if (state.msgChatId != null && state.msgId != null) {
+        const kbd = {
+          inline_keyboard: [
+            [{ text: "Настроить", callback_data: CB.team(isPrivate ? cid : null, text) }],
+            [{ text: "← К списку команд", callback_data: isPrivate ? CB.teams(cid) : CB.teams(null) }]
+          ]
+        };
+        await ctx.telegram.editMessageText(state.msgChatId, state.msgId, null, `Команда /${text} создана.`, kbd).catch(() => {});
+      } else {
+        await ctx.reply(`Команда /${text} создана. Настрой через /admin.`);
+      }
+      return;
+    }
+    if (state.step === "rename_team") {
+      const oldSlug = state.slug;
+      if (!text || text.length > SLUG_MAX_LEN || !SLUG_REGEX.test(text)) {
+        await ctx.reply("Неверный формат. Только латиница, цифры и _ до 32 символов.");
+        return;
+      }
+      if (text === oldSlug) {
+        adminInputState.delete(ctx.from.id);
+        if (state.msgChatId != null && state.msgId != null) {
+          const n = getTeamMemberCount(cid, oldSlug);
+          await ctx.telegram.editMessageText(state.msgChatId, state.msgId, null, `Команда /${oldSlug}. Участников: ${n}`, buildTeamScreenKeyboard(isPrivate, isPrivate ? cid : null, oldSlug)).catch(() => {});
+        }
+        return;
+      }
+      if (getTeamStmt.get(cid, text)) {
+        await ctx.reply(`Команда /${text} уже есть.`);
+        return;
+      }
+      updateTeamSlugStmt.run(text, cid, oldSlug);
+      updateTeamMembersSlugStmt.run(text, cid, oldSlug);
+      adminInputState.delete(ctx.from.id);
+      if (state.msgChatId != null && state.msgId != null) {
+        const n = getTeamMemberCount(cid, text);
+        await ctx.telegram.editMessageText(state.msgChatId, state.msgId, null, `Команда /${text}. Участников: ${n}`, buildTeamScreenKeyboard(isPrivate, isPrivate ? cid : null, text)).catch(() => {});
+      } else {
+        await ctx.reply(`Переименовано в /${text}.`);
+      }
+      return;
+    }
   }
   return next();
 });
@@ -245,254 +328,626 @@ bot.command("ping", async (ctx) => {
   }
 });
 
-bot.command("admin", async (ctx) => {
-  if (!isGroupChat(ctx)) {
-    return ctx.reply("Команда только для групп.");
-  }
-  const ok = await isAdmin(ctx, ctx.from.id);
-  if (!ok) {
-    return ctx.reply("⛔️ Только админы группы могут менять настройки.");
-  }
-  const chatId = ctx.chat.id;
+// -------------------- Unified /admin menu --------------------
+const CB = {
+  list: "adm_list",
+  grp: (cid) => `adm_grp:${cid}`,
+  menu: (cid) => (cid == null ? "adm_menu" : `adm_menu:${cid}`),
+  tag: (cid) => (cid == null ? "adm_tag" : `adm_tag:${cid}`),
+  teams: (cid) => (cid == null ? "adm_teams" : `adm_teams:${cid}`),
+  team: (cid, slug) => (cid == null ? `adm_team:${slug}` : `adm_team:${cid}:${slug}`),
+  add: (cid, slug, page) => (cid == null ? `adm_add:${slug}:${page}` : `adm_add:${cid}:${slug}:${page}`),
+  rem: (cid, slug, page) => (cid == null ? `adm_rem:${slug}:${page}` : `adm_rem:${cid}:${slug}:${page}`),
+  add1: (cid, slug, uid) => (cid == null ? `adm_a1:${slug}:${uid}` : `adm_a1:${cid}:${slug}:${uid}`),
+  rem1: (cid, slug, uid) => (cid == null ? `adm_r1:${slug}:${uid}` : `adm_r1:${cid}:${slug}:${uid}`),
+  back: (cid, slug) => (cid == null ? `adm_back:${slug}` : `adm_back:${cid}:${slug}`),
+  rename: (cid, slug) => (cid == null ? `adm_ren:${slug}` : `adm_ren:${cid}:${slug}`),
+  del: (cid, slug) => (cid == null ? `adm_del:${slug}` : `adm_del:${cid}:${slug}`),
+  delOk: (cid, slug) => (cid == null ? `adm_delok:${slug}` : `adm_delok:${cid}:${slug}`),
+  newteam: (cid) => (cid == null ? "adm_new" : `adm_new:${cid}`),
+  who: (cid, w) => (cid == null ? `adm_who:${w}` : `adm_who:${cid}:${w}`),
+  cancelNew: (cid) => (cid == null ? "adm_cn" : `adm_cn:${cid}`),
+  cancelRen: (cid, slug) => (cid == null ? `adm_cr:${slug}` : `adm_cr:${cid}:${slug}`),
+  delNo: (cid, slug) => (cid == null ? `adm_delno:${slug}` : `adm_delno:${cid}:${slug}`)
+};
+
+function buildMainMenuKeyboard(isPrivate, chatId) {
+  const cid = isPrivate ? String(chatId) : null;
+  const rows = [
+    [{ text: "Кто может тегать", callback_data: CB.tag(cid) }],
+    [{ text: "Подгруппы (команды)", callback_data: CB.teams(cid) }]
+  ];
+  if (isPrivate) rows.push([{ text: "← К списку групп", callback_data: CB.list }]);
+  else rows.push([{ text: "Закрыть", callback_data: "adm_close" }]);
+  return { inline_keyboard: rows };
+}
+
+function buildWhoKeyboard(isPrivate, chatId) {
+  const cid = isPrivate ? String(chatId) : null;
   const onlyAdmins = getTagallOnlyAdmins(chatId);
-  await ctx.reply("Кто может использовать /tagall?", {
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: onlyAdmins ? "✓ Только админы" : "Только админы", callback_data: "tagall_who:admins" },
-          { text: !onlyAdmins ? "✓ Все участники" : "Все участники", callback_data: "tagall_who:all" }
-        ]
-      ]
+  return {
+    inline_keyboard: [
+      [
+        { text: onlyAdmins ? "✓ Только админы" : "Только админы", callback_data: CB.who(cid, "admins") },
+        { text: !onlyAdmins ? "✓ Все участники" : "Все участники", callback_data: CB.who(cid, "all") }
+      ],
+      [{ text: "← Назад", callback_data: CB.menu(cid) }]
+    ]
+  };
+}
+
+function buildTeamScreenKeyboard(isPrivate, chatId, slug) {
+  const cid = isPrivate ? String(chatId) : null;
+  return {
+    inline_keyboard: [
+      [
+        { text: "➕ Добавить", callback_data: CB.add(cid, slug, 0) },
+        { text: "➖ Убрать", callback_data: CB.rem(cid, slug, 0) }
+      ],
+      [
+        { text: "✏️ Переименовать", callback_data: CB.rename(cid, slug) },
+        { text: "🗑 Удалить", callback_data: CB.del(cid, slug) }
+      ],
+      [{ text: "← К списку команд", callback_data: CB.teams(cid) }]
+    ]
+  };
+}
+
+async function getChatTitleSafe(ctx, chatId) {
+  try {
+    const chat = await ctx.telegram.getChat(chatId);
+    return chat?.title || `Группа ${chatId}`;
+  } catch (e) {
+    return `Группа ${chatId}`;
+  }
+}
+
+bot.command("admin", async (ctx) => {
+  if (ctx.chat.type === "private") {
+    const rows = distinctChatIdsStmt.all();
+    const allowed = [];
+    for (const r of rows) {
+      const cid = r.chat_id;
+      const ok = await isAdminInChat(ctx, cid, ctx.from.id);
+      if (ok) allowed.push({ chatId: cid, title: await getChatTitleSafe(ctx, cid) });
     }
-  });
+    if (!allowed.length) return ctx.reply("Нет групп, где ты админ и добавлен бот.");
+    const keyboard = {
+      inline_keyboard: allowed.map((g) => [{ text: g.title, callback_data: CB.grp(g.chatId) }])
+    };
+    return ctx.reply("Выбери группу:", keyboard);
+  }
+  if (!isGroupChat(ctx)) return ctx.reply("Команда только для групп.");
+  const ok = await isAdmin(ctx, ctx.from.id);
+  if (!ok) return ctx.reply("⛔️ Только админы группы могут менять настройки.");
+  await ctx.reply("Настройки группы", buildMainMenuKeyboard(false, null));
 });
 
-bot.action(/^tagall_who:(admins|all)$/, async (ctx) => {
+bot.action(/^adm_list$/, async (ctx) => {
+  if (ctx.callbackQuery.message.chat.type !== "private") return ctx.answerCbQuery();
+  const rows = distinctChatIdsStmt.all();
+  const allowed = [];
+  for (const r of rows) {
+    const ok = await isAdminInChat(ctx, r.chat_id, ctx.from.id);
+    if (ok) allowed.push({ chatId: r.chat_id, title: await getChatTitleSafe(ctx, r.chat_id) });
+  }
+  const keyboard = {
+    inline_keyboard: allowed.map((g) => [{ text: g.title, callback_data: CB.grp(g.chatId) }])
+  };
+  await ctx.answerCbQuery();
+  await ctx.editMessageText("Выбери группу:", keyboard).catch(() => {});
+});
+
+bot.action(/^adm_grp:(-?\d+)$/, async (ctx) => {
+  const chatId = ctx.match[1];
+  if (ctx.callbackQuery.message.chat.type !== "private") return ctx.answerCbQuery();
+  const ok = await isAdminInChat(ctx, chatId, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Нет прав в этой группе.");
+  const title = await getChatTitleSafe(ctx, chatId);
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(`Настройки: ${title}`, buildMainMenuKeyboard(true, chatId)).catch(() => {});
+});
+
+bot.action(/^adm_menu$/, async (ctx) => {
+  if (ctx.chat?.type !== "group" && ctx.chat?.type !== "supergroup") return ctx.answerCbQuery();
+  await ctx.answerCbQuery();
+  await ctx.editMessageText("Настройки группы", buildMainMenuKeyboard(false, null)).catch(() => {});
+});
+
+bot.action(/^adm_menu:(.+)$/, async (ctx) => {
+  const chatId = ctx.match[1];
+  if (ctx.callbackQuery.message.chat.type !== "private") return ctx.answerCbQuery();
+  const ok = await isAdminInChat(ctx, chatId, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Нет прав.");
+  const title = await getChatTitleSafe(ctx, chatId);
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(`Настройки: ${title}`, buildMainMenuKeyboard(true, chatId)).catch(() => {});
+});
+
+bot.action(/^adm_close$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+});
+
+bot.action(/^adm_tag$/, async (ctx) => {
+  const chatId = ctx.chat?.id || ctx.callbackQuery?.message?.chat?.id;
+  if (!chatId) return ctx.answerCbQuery("Ошибка");
+  const ok = await isAdmin(ctx, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Только админы.");
+  await ctx.answerCbQuery();
+  await ctx.editMessageText("Кто может использовать /tagall и команды?", buildWhoKeyboard(false, chatId)).catch(() => {});
+});
+
+bot.action(/^adm_tag:(.+)$/, async (ctx) => {
+  const chatId = ctx.match[1];
+  if (ctx.callbackQuery.message.chat.type !== "private") return ctx.answerCbQuery();
+  const ok = await isAdminInChat(ctx, chatId, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Нет прав.");
+  await ctx.answerCbQuery();
+  await ctx.editMessageText("Кто может использовать /tagall и команды?", buildWhoKeyboard(true, chatId)).catch(() => {});
+});
+
+bot.action(/^adm_who:(admins|all)$/, async (ctx) => {
   const who = ctx.match[1];
   const chatId = ctx.chat?.id || ctx.callbackQuery?.message?.chat?.id;
   if (!chatId) return ctx.answerCbQuery("Ошибка");
-  const isAdminUser = await isAdmin(ctx, ctx.from.id);
-  if (!isAdminUser) {
-    return ctx.answerCbQuery("Только админы могут менять настройки.");
-  }
-  const onlyAdmins = who === "admins" ? 1 : 0;
-  setTagallOnlyAdminsStmt.run(String(chatId), onlyAdmins);
-  const onlyAdminsNow = getTagallOnlyAdmins(chatId);
+  const ok = await isAdmin(ctx, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Только админы.");
+  setTagallOnlyAdminsStmt.run(String(chatId), who === "admins" ? 1 : 0);
   await ctx.answerCbQuery();
-  await ctx.editMessageReplyMarkup({
-    inline_keyboard: [
-      [
-        { text: onlyAdminsNow ? "✓ Только админы" : "Только админы", callback_data: "tagall_who:admins" },
-        { text: !onlyAdminsNow ? "✓ Все участники" : "Все участники", callback_data: "tagall_who:all" }
-      ]
-    ]
+  await ctx.editMessageText("Настройки группы", buildMainMenuKeyboard(false, null)).catch(() => {});
+});
+
+bot.action(/^adm_who:(.+):(admins|all)$/, async (ctx) => {
+  const chatId = ctx.match[1];
+  const who = ctx.match[2];
+  if (ctx.callbackQuery.message.chat.type !== "private") return ctx.answerCbQuery();
+  const ok = await isAdminInChat(ctx, chatId, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Нет прав.");
+  setTagallOnlyAdminsStmt.run(String(chatId), who === "admins" ? 1 : 0);
+  await ctx.answerCbQuery();
+  const title = await getChatTitleSafe(ctx, chatId);
+  await ctx.editMessageText(`Настройки: ${title}`, buildMainMenuKeyboard(true, chatId)).catch(() => {});
+});
+
+bot.action(/^adm_teams$/, async (ctx) => {
+  const chatId = ctx.chat?.id || ctx.callbackQuery?.message?.chat?.id;
+  if (!chatId) return ctx.answerCbQuery();
+  const ok = await isAdmin(ctx, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Только админы.");
+  const cid = String(chatId);
+  const teams = listTeamsStmt.all(cid);
+  const rows = teams.map((t) => {
+    const n = getTeamMemberCount(cid, t.slug);
+    return [{ text: `/${t.slug} (${n})`, callback_data: CB.team(null, t.slug) }];
+  });
+  rows.push([{ text: "➕ Создать команду", callback_data: CB.newteam(null) }]);
+  rows.push([{ text: "← Назад", callback_data: CB.menu(null) }]);
+  await ctx.answerCbQuery();
+  await ctx.editMessageText("Подгруппы (команды):", { inline_keyboard: rows }).catch(() => {});
+});
+
+bot.action(/^adm_teams:(.+)$/, async (ctx) => {
+  const chatId = ctx.match[1];
+  if (ctx.callbackQuery.message.chat.type !== "private") return ctx.answerCbQuery();
+  const ok = await isAdminInChat(ctx, chatId, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Нет прав.");
+  const cid = String(chatId);
+  const teams = listTeamsStmt.all(cid);
+  const rows = teams.map((t) => {
+    const n = getTeamMemberCount(cid, t.slug);
+    return [{ text: `/${t.slug} (${n})`, callback_data: CB.team(chatId, t.slug) }];
+  });
+  rows.push([{ text: "➕ Создать команду", callback_data: CB.newteam(chatId) }]);
+  rows.push([{ text: "← Назад", callback_data: CB.menu(chatId) }]);
+  await ctx.answerCbQuery();
+  const title = await getChatTitleSafe(ctx, chatId);
+  await ctx.editMessageText(`${title}\nПодгруппы (команды):`, { inline_keyboard: rows }).catch(() => {});
+});
+
+bot.action(/^adm_team:([^:]+)$/, async (ctx) => {
+  const slug = ctx.match[1];
+  const chatId = ctx.chat?.id || ctx.callbackQuery?.message?.chat?.id;
+  if (!chatId) return ctx.answerCbQuery();
+  const ok = await isAdmin(ctx, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Только админы.");
+  const cid = String(chatId);
+  if (!getTeamStmt.get(cid, slug)) return ctx.answerCbQuery("Команда не найдена.");
+  const n = getTeamMemberCount(cid, slug);
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, buildTeamScreenKeyboard(false, null, slug)).catch(() => {});
+});
+
+bot.action(/^adm_team:(.+):([^:]+)$/, async (ctx) => {
+  const chatId = ctx.match[1];
+  const slug = ctx.match[2];
+  if (ctx.callbackQuery.message.chat.type !== "private") return ctx.answerCbQuery();
+  const ok = await isAdminInChat(ctx, chatId, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Нет прав.");
+  const cid = String(chatId);
+  if (!getTeamStmt.get(cid, slug)) return ctx.answerCbQuery("Команда не найдена.");
+  const n = getTeamMemberCount(cid, slug);
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, buildTeamScreenKeyboard(true, chatId, slug)).catch(() => {});
+});
+
+function buildAddPageKeyboard(cid, slug, page, isPrivate) {
+  const candidates = selectChatMembersNotInTeamStmt.all(cid, cid, slug);
+  const totalPages = Math.max(1, Math.ceil(candidates.length / TEAM_ADD_PAGE_SIZE));
+  const p = Math.min(page, totalPages - 1);
+  const start = p * TEAM_ADD_PAGE_SIZE;
+  const pageCandidates = candidates.slice(start, start + TEAM_ADD_PAGE_SIZE);
+  const rows = pageCandidates.map((u) => [{ text: "+ " + shortNameForButton(u), callback_data: CB.add1(isPrivate ? cid : null, slug, u.user_id) }]);
+  const nav = [];
+  if (totalPages > 1) {
+    if (p > 0) nav.push({ text: "◀", callback_data: CB.add(isPrivate ? cid : null, slug, p - 1) });
+    nav.push({ text: `${p + 1}/${totalPages}`, callback_data: CB.add(isPrivate ? cid : null, slug, p) });
+    if (p < totalPages - 1) nav.push({ text: "▶", callback_data: CB.add(isPrivate ? cid : null, slug, p + 1) });
+  }
+  rows.push(nav.length ? nav : []);
+  rows.push([{ text: "← Назад", callback_data: CB.back(isPrivate ? cid : null, slug) }]);
+  return { rows, candidates, p, totalPages };
+}
+
+function buildRemPageKeyboard(cid, slug, page, isPrivate) {
+  const members = selectTeamMembersForRemovalStmt.all(cid, slug);
+  const totalPages = Math.max(1, Math.ceil(members.length / TEAM_REM_PAGE_SIZE));
+  const p = Math.min(page, totalPages - 1);
+  const start = p * TEAM_REM_PAGE_SIZE;
+  const pageMembers = members.slice(start, start + TEAM_REM_PAGE_SIZE);
+  const rows = pageMembers.map((u) => [{ text: "− " + shortNameForButton(u), callback_data: CB.rem1(isPrivate ? cid : null, slug, u.user_id) }]);
+  const nav = [];
+  if (totalPages > 1) {
+    if (p > 0) nav.push({ text: "◀", callback_data: CB.rem(isPrivate ? cid : null, slug, p - 1) });
+    nav.push({ text: `${p + 1}/${totalPages}`, callback_data: CB.rem(isPrivate ? cid : null, slug, p) });
+    if (p < totalPages - 1) nav.push({ text: "▶", callback_data: CB.rem(isPrivate ? cid : null, slug, p + 1) });
+  }
+  rows.push(nav.length ? nav : []);
+  rows.push([{ text: "← Назад", callback_data: CB.back(isPrivate ? cid : null, slug) }]);
+  return { rows, members, p, totalPages };
+}
+
+bot.action(/^adm_add:([^:]+):(\d+)$/, async (ctx) => {
+  const slug = ctx.match[1];
+  const page = parseInt(ctx.match[2], 10) || 0;
+  const chatId = ctx.chat?.id || ctx.callbackQuery?.message?.chat?.id;
+  if (!chatId) return ctx.answerCbQuery();
+  const ok = await isAdmin(ctx, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Только админы.");
+  const cid = String(chatId);
+  const { rows, candidates, p, totalPages } = buildAddPageKeyboard(cid, slug, page, false);
+  const text = candidates.length ? `Команда /${slug}. Добавить (стр. ${p + 1}/${totalPages}):` : `Команда /${slug}. Нет кого добавить.`;
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(text, { inline_keyboard: rows }).catch(() => {});
+});
+
+bot.action(/^adm_add:(.+):([^:]+):(\d+)$/, async (ctx) => {
+  const chatId = ctx.match[1];
+  const slug = ctx.match[2];
+  const page = parseInt(ctx.match[3], 10) || 0;
+  if (ctx.callbackQuery.message.chat.type !== "private") return ctx.answerCbQuery();
+  const ok = await isAdminInChat(ctx, chatId, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Нет прав.");
+  const cid = String(chatId);
+  const { rows, candidates, p, totalPages } = buildAddPageKeyboard(cid, slug, page, true);
+  const text = candidates.length ? `Команда /${slug}. Добавить (стр. ${p + 1}/${totalPages}):` : `Команда /${slug}. Нет кого добавить.`;
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(text, { inline_keyboard: rows }).catch(() => {});
+});
+
+bot.action(/^adm_rem:([^:]+):(\d+)$/, async (ctx) => {
+  const slug = ctx.match[1];
+  const page = parseInt(ctx.match[2], 10) || 0;
+  const chatId = ctx.chat?.id || ctx.callbackQuery?.message?.chat?.id;
+  if (!chatId) return ctx.answerCbQuery();
+  const ok = await isAdmin(ctx, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Только админы.");
+  const cid = String(chatId);
+  const { rows, members, p, totalPages } = buildRemPageKeyboard(cid, slug, page, false);
+  const text = members.length ? `Команда /${slug}. Убрать (стр. ${p + 1}/${totalPages}):` : `Команда /${slug}. В команде никого.`;
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(text, { inline_keyboard: rows }).catch(() => {});
+});
+
+bot.action(/^adm_rem:(.+):([^:]+):(\d+)$/, async (ctx) => {
+  const chatId = ctx.match[1];
+  const slug = ctx.match[2];
+  const page = parseInt(ctx.match[3], 10) || 0;
+  if (ctx.callbackQuery.message.chat.type !== "private") return ctx.answerCbQuery();
+  const ok = await isAdminInChat(ctx, chatId, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Нет прав.");
+  const cid = String(chatId);
+  const { rows, members, p, totalPages } = buildRemPageKeyboard(cid, slug, page, true);
+  const text = members.length ? `Команда /${slug}. Убрать (стр. ${p + 1}/${totalPages}):` : `Команда /${slug}. В команде никого.`;
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(text, { inline_keyboard: rows }).catch(() => {});
+});
+
+bot.action(/^adm_a1:([^:]+):(\d+)$/, async (ctx) => {
+  const slug = ctx.match[1];
+  const userId = parseInt(ctx.match[2], 10);
+  const chatId = ctx.chat?.id || ctx.callbackQuery?.message?.chat?.id;
+  if (!chatId) return ctx.answerCbQuery();
+  const ok = await isAdmin(ctx, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Только админы.");
+  const cid = String(chatId);
+  try { insertTeamMemberStmt.run(cid, slug, userId); } catch (e) {}
+  await ctx.answerCbQuery("Добавлен");
+  const n = getTeamMemberCount(cid, slug);
+  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, buildTeamScreenKeyboard(false, null, slug)).catch(() => {});
+});
+
+bot.action(/^adm_a1:(.+):([^:]+):(\d+)$/, async (ctx) => {
+  const chatId = ctx.match[1];
+  const slug = ctx.match[2];
+  const userId = parseInt(ctx.match[3], 10);
+  if (ctx.callbackQuery.message.chat.type !== "private") return ctx.answerCbQuery();
+  const ok = await isAdminInChat(ctx, chatId, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Нет прав.");
+  const cid = String(chatId);
+  try { insertTeamMemberStmt.run(cid, slug, userId); } catch (e) {}
+  await ctx.answerCbQuery("Добавлен");
+  const n = getTeamMemberCount(cid, slug);
+  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, buildTeamScreenKeyboard(true, chatId, slug)).catch(() => {});
+});
+
+bot.action(/^adm_r1:([^:]+):(\d+)$/, async (ctx) => {
+  const slug = ctx.match[1];
+  const userId = parseInt(ctx.match[2], 10);
+  const chatId = ctx.chat?.id || ctx.callbackQuery?.message?.chat?.id;
+  if (!chatId) return ctx.answerCbQuery();
+  const ok = await isAdmin(ctx, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Только админы.");
+  const cid = String(chatId);
+  deleteTeamMemberStmt.run(cid, slug, userId);
+  await ctx.answerCbQuery("Убран");
+  const n = getTeamMemberCount(cid, slug);
+  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, buildTeamScreenKeyboard(false, null, slug)).catch(() => {});
+});
+
+bot.action(/^adm_r1:(.+):([^:]+):(\d+)$/, async (ctx) => {
+  const chatId = ctx.match[1];
+  const slug = ctx.match[2];
+  const userId = parseInt(ctx.match[3], 10);
+  if (ctx.callbackQuery.message.chat.type !== "private") return ctx.answerCbQuery();
+  const ok = await isAdminInChat(ctx, chatId, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Нет прав.");
+  const cid = String(chatId);
+  deleteTeamMemberStmt.run(cid, slug, userId);
+  await ctx.answerCbQuery("Убран");
+  const n = getTeamMemberCount(cid, slug);
+  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, buildTeamScreenKeyboard(true, chatId, slug)).catch(() => {});
+});
+
+bot.action(/^adm_back:([^:]+)$/, async (ctx) => {
+  const slug = ctx.match[1];
+  const chatId = ctx.chat?.id || ctx.callbackQuery?.message?.chat?.id;
+  if (!chatId) return ctx.answerCbQuery();
+  const cid = String(chatId);
+  const n = getTeamMemberCount(cid, slug);
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, buildTeamScreenKeyboard(false, null, slug)).catch(() => {});
+});
+
+bot.action(/^adm_back:(.+):([^:]+)$/, async (ctx) => {
+  const chatId = ctx.match[1];
+  const slug = ctx.match[2];
+  if (ctx.callbackQuery.message.chat.type !== "private") return ctx.answerCbQuery();
+  const ok = await isAdminInChat(ctx, chatId, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Нет прав.");
+  const cid = String(chatId);
+  const n = getTeamMemberCount(cid, slug);
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, buildTeamScreenKeyboard(true, chatId, slug)).catch(() => {});
+});
+
+bot.action(/^adm_ren:([^:]+)$/, async (ctx) => {
+  const slug = ctx.match[1];
+  const chatId = ctx.chat?.id || ctx.callbackQuery?.message?.chat?.id;
+  if (!chatId) return ctx.answerCbQuery();
+  const ok = await isAdmin(ctx, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Только админы.");
+  const msg = ctx.callbackQuery.message;
+  adminInputState.set(ctx.from.id, { chatId: String(chatId), step: "rename_team", slug, msgChatId: msg.chat.id, msgId: msg.message_id });
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(`Введи новое имя для /${slug} (латиница, цифры, _ до 32 символов):`, {
+    reply_markup: { inline_keyboard: [[{ text: "Отмена", callback_data: CB.cancelRen(null, slug) }]] }
   }).catch(() => {});
 });
 
-// -------------------- Teams: newteam, manage --------------------
-bot.command("newteam", async (ctx) => {
-  if (!isGroupChat(ctx)) return ctx.reply("Команда только для групп.");
+bot.action(/^adm_ren:(.+):([^:]+)$/, async (ctx) => {
+  const chatId = ctx.match[1];
+  const slug = ctx.match[2];
+  if (ctx.callbackQuery.message.chat.type !== "private") return ctx.answerCbQuery();
+  const ok = await isAdminInChat(ctx, chatId, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Нет прав.");
+  const msg = ctx.callbackQuery.message;
+  adminInputState.set(ctx.from.id, { chatId, step: "rename_team", slug, msgChatId: msg.chat.id, msgId: msg.message_id });
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(`Введи новое имя для /${slug} (латиница, цифры, _ до 32 символов):`, {
+    reply_markup: { inline_keyboard: [[{ text: "Отмена", callback_data: CB.cancelRen(chatId, slug) }]] }
+  }).catch(() => {});
+});
+
+bot.action(/^adm_del:([^:]+)$/, async (ctx) => {
+  const slug = ctx.match[1];
+  const chatId = ctx.chat?.id || ctx.callbackQuery?.message?.chat?.id;
+  if (!chatId) return ctx.answerCbQuery();
   const ok = await isAdmin(ctx, ctx.from.id);
-  if (!ok) return ctx.reply("⛔️ Только админы могут создавать команды.");
-  const slug = ctx.message?.text?.split(/\s+/)[1]?.trim();
-  if (!slug || slug.length > SLUG_MAX_LEN || !SLUG_REGEX.test(slug)) {
-    return ctx.reply("Использование: /newteam <имя> — только латиница, цифры и _ (до 32 символов).");
-  }
-  const chatId = String(ctx.chat.id);
-  if (getTeamStmt.get(chatId, slug)) {
-    return ctx.reply(`Команда /${slug} уже есть.`);
-  }
-  insertTeamStmt.run(chatId, slug);
-  return ctx.reply(`Команда /${slug} создана. Добавь участников: /manage ${slug}`);
+  if (!ok) return ctx.answerCbQuery("Только админы.");
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(`Удалить /${slug}? Участники не удалятся из группы.`, {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "Да, удалить", callback_data: CB.delOk(null, slug) }, { text: "Отмена", callback_data: CB.delNo(null, slug) }]
+      ]
+    }
+  }).catch(() => {});
+});
+
+bot.action(/^adm_del:(.+):([^:]+)$/, async (ctx) => {
+  const chatId = ctx.match[1];
+  const slug = ctx.match[2];
+  if (ctx.callbackQuery.message.chat.type !== "private") return ctx.answerCbQuery();
+  const ok = await isAdminInChat(ctx, chatId, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Нет прав.");
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(`Удалить /${slug}? Участники не удалятся из группы.`, {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "Да, удалить", callback_data: CB.delOk(chatId, slug) }, { text: "Отмена", callback_data: CB.delNo(chatId, slug) }]
+      ]
+    }
+  }).catch(() => {});
+});
+
+bot.action(/^adm_delok:([^:]+)$/, async (ctx) => {
+  const slug = ctx.match[1];
+  const chatId = ctx.chat?.id || ctx.callbackQuery?.message?.chat?.id;
+  if (!chatId) return ctx.answerCbQuery();
+  const ok = await isAdmin(ctx, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Только админы.");
+  const cid = String(chatId);
+  deleteTeamAllMembersStmt.run(cid, slug);
+  deleteTeamStmt.run(cid, slug);
+  await ctx.answerCbQuery();
+  const teams = listTeamsStmt.all(cid);
+  const rows = teams.map((t) => {
+    const n = getTeamMemberCount(cid, t.slug);
+    return [{ text: `/${t.slug} (${n})`, callback_data: CB.team(null, t.slug) }];
+  });
+  rows.push([{ text: "➕ Создать команду", callback_data: CB.newteam(null) }]);
+  rows.push([{ text: "← Назад", callback_data: CB.menu(null) }]);
+  await ctx.editMessageText("Подгруппы (команды):", { inline_keyboard: rows }).catch(() => {});
+});
+
+bot.action(/^adm_delok:(.+):([^:]+)$/, async (ctx) => {
+  const chatId = ctx.match[1];
+  const slug = ctx.match[2];
+  if (ctx.callbackQuery.message.chat.type !== "private") return ctx.answerCbQuery();
+  const ok = await isAdminInChat(ctx, chatId, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Нет прав.");
+  const cid = String(chatId);
+  deleteTeamAllMembersStmt.run(cid, slug);
+  deleteTeamStmt.run(cid, slug);
+  await ctx.answerCbQuery();
+  const teams = listTeamsStmt.all(cid);
+  const rows = teams.map((t) => {
+    const n = getTeamMemberCount(cid, t.slug);
+    return [{ text: `/${t.slug} (${n})`, callback_data: CB.team(chatId, t.slug) }];
+  });
+  rows.push([{ text: "➕ Создать команду", callback_data: CB.newteam(chatId) }]);
+  rows.push([{ text: "← Назад", callback_data: CB.menu(chatId) }]);
+  const title = await getChatTitleSafe(ctx, chatId);
+  await ctx.editMessageText(`${title}\nПодгруппы (команды):`, { inline_keyboard: rows }).catch(() => {});
+});
+
+bot.action(/^adm_delno:([^:]+)$/, async (ctx) => {
+  const slug = ctx.match[1];
+  const chatId = ctx.chat?.id || ctx.callbackQuery?.message?.chat?.id;
+  if (!chatId) return ctx.answerCbQuery();
+  const cid = String(chatId);
+  const n = getTeamMemberCount(cid, slug);
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, buildTeamScreenKeyboard(false, null, slug)).catch(() => {});
+});
+
+bot.action(/^adm_delno:(.+):([^:]+)$/, async (ctx) => {
+  const chatId = ctx.match[1];
+  const slug = ctx.match[2];
+  if (ctx.callbackQuery.message.chat.type !== "private") return ctx.answerCbQuery();
+  const cid = String(chatId);
+  const n = getTeamMemberCount(cid, slug);
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, buildTeamScreenKeyboard(true, chatId, slug)).catch(() => {});
+});
+
+bot.action(/^adm_new$/, async (ctx) => {
+  const chatId = ctx.chat?.id || ctx.callbackQuery?.message?.chat?.id;
+  if (!chatId) return ctx.answerCbQuery();
+  const ok = await isAdmin(ctx, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Только админы.");
+  const msg = ctx.callbackQuery.message;
+  adminInputState.set(ctx.from.id, { chatId: String(chatId), step: "new_team_slug", msgChatId: msg.chat.id, msgId: msg.message_id });
+  await ctx.answerCbQuery();
+  await ctx.editMessageText("Введи имя команды (латиница, цифры, _ до 32 символов). Например: tagbar", {
+    reply_markup: { inline_keyboard: [[{ text: "Отмена", callback_data: CB.cancelNew(null) }]] }
+  }).catch(() => {});
+});
+
+bot.action(/^adm_new:(.+)$/, async (ctx) => {
+  const chatId = ctx.match[1];
+  if (ctx.callbackQuery.message.chat.type !== "private") return ctx.answerCbQuery();
+  const ok = await isAdminInChat(ctx, chatId, ctx.from.id);
+  if (!ok) return ctx.answerCbQuery("Нет прав.");
+  const msg = ctx.callbackQuery.message;
+  adminInputState.set(ctx.from.id, { chatId, step: "new_team_slug", msgChatId: msg.chat.id, msgId: msg.message_id });
+  await ctx.answerCbQuery();
+  await ctx.editMessageText("Введи имя команды (латиница, цифры, _ до 32 символов). Например: tagbar", {
+    reply_markup: { inline_keyboard: [[{ text: "Отмена", callback_data: CB.cancelNew(chatId) }]] }
+  }).catch(() => {});
+});
+
+bot.action(/^adm_cn$/, async (ctx) => {
+  adminInputState.delete(ctx.from.id);
+  const chatId = ctx.callbackQuery?.message?.chat?.id;
+  if (!chatId) return ctx.answerCbQuery();
+  const cid = String(chatId);
+  const teams = listTeamsStmt.all(cid);
+  const rows = teams.map((t) => {
+    const n = getTeamMemberCount(cid, t.slug);
+    return [{ text: `/${t.slug} (${n})`, callback_data: CB.team(null, t.slug) }];
+  });
+  rows.push([{ text: "➕ Создать команду", callback_data: CB.newteam(null) }]);
+  rows.push([{ text: "← Назад", callback_data: CB.menu(null) }]);
+  await ctx.answerCbQuery();
+  await ctx.editMessageText("Подгруппы (команды):", { inline_keyboard: rows }).catch(() => {});
+});
+
+bot.action(/^adm_cn:(.+)$/, async (ctx) => {
+  const chatId = ctx.match[1];
+  if (ctx.callbackQuery.message.chat.type !== "private") return ctx.answerCbQuery();
+  adminInputState.delete(ctx.from.id);
+  const cid = String(chatId);
+  const teams = listTeamsStmt.all(cid);
+  const rows = teams.map((t) => {
+    const n = getTeamMemberCount(cid, t.slug);
+    return [{ text: `/${t.slug} (${n})`, callback_data: CB.team(chatId, t.slug) }];
+  });
+  rows.push([{ text: "➕ Создать команду", callback_data: CB.newteam(chatId) }]);
+  rows.push([{ text: "← Назад", callback_data: CB.menu(chatId) }]);
+  const title = await getChatTitleSafe(ctx, chatId);
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(`${title}\nПодгруппы (команды):`, { inline_keyboard: rows }).catch(() => {});
+});
+
+bot.action(/^adm_cr:([^:]+)$/, async (ctx) => {
+  const slug = ctx.match[1];
+  const chatId = ctx.chat?.id || ctx.callbackQuery?.message?.chat?.id;
+  adminInputState.delete(ctx.from.id);
+  const cid = String(chatId);
+  const n = getTeamMemberCount(cid, slug);
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, buildTeamScreenKeyboard(false, null, slug)).catch(() => {});
+});
+
+bot.action(/^adm_cr:(.+):([^:]+)$/, async (ctx) => {
+  const chatId = ctx.match[1];
+  const slug = ctx.match[2];
+  if (ctx.callbackQuery.message.chat.type !== "private") return ctx.answerCbQuery();
+  adminInputState.delete(ctx.from.id);
+  const cid = String(chatId);
+  const n = getTeamMemberCount(cid, slug);
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, buildTeamScreenKeyboard(true, chatId, slug)).catch(() => {});
 });
 
 function getTeamMemberCount(chatId, slug) {
   return teamMemberCountStmt.get(String(chatId), slug)?.n ?? 0;
 }
 
-function buildManageMainKeyboard(slug) {
-  return {
-    inline_keyboard: [
-      [
-        { text: "Добавить участников", callback_data: `t_add:${slug}:0` },
-        { text: "Убрать участников", callback_data: `t_rem:${slug}:0` }
-      ],
-      [{ text: "Готово", callback_data: `t_done:${slug}` }]
-    ]
-  };
-}
-
 const TEAM_ADD_PAGE_SIZE = 8;
 const TEAM_REM_PAGE_SIZE = 8;
-
-bot.command("manage", async (ctx) => {
-  if (!isGroupChat(ctx)) return ctx.reply("Команда только для групп.");
-  const ok = await isAdmin(ctx, ctx.from.id);
-  if (!ok) return ctx.reply("⛔️ Только админы могут настраивать команды.");
-  const slug = ctx.message?.text?.split(/\s+/)[1]?.trim();
-  if (!slug) return ctx.reply("Использование: /manage <имя команды>");
-  const chatId = String(ctx.chat.id);
-  if (!getTeamStmt.get(chatId, slug)) {
-    return ctx.reply("Команды с таким именем нет.");
-  }
-  const n = getTeamMemberCount(chatId, slug);
-  await ctx.reply(`Команда /${slug}. Участников: ${n}`, buildManageMainKeyboard(slug));
-});
-
-async function editToManageMain(ctx, chatId, slug) {
-  const n = getTeamMemberCount(chatId, slug);
-  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, buildManageMainKeyboard(slug)).catch(() => {});
-}
-
-bot.action(/^t_done:(.+)$/, async (ctx) => {
-  const slug = ctx.match[1];
-  const chatId = ctx.callbackQuery?.message?.chat?.id;
-  if (!chatId) return ctx.answerCbQuery("Ошибка");
-  const isAdminUser = await isAdmin(ctx, ctx.from.id);
-  if (!isAdminUser) return ctx.answerCbQuery("Только админы.");
-  await ctx.answerCbQuery();
-  const n = getTeamMemberCount(String(chatId), slug);
-  await ctx.editMessageText(`Готово. /${slug} — ${n} участников`, { reply_markup: { inline_keyboard: [] } }).catch(() => {});
-});
-
-bot.action(/^t_add:([^:]+):(\d+)$/, async (ctx) => {
-  const slug = ctx.match[1];
-  const page = parseInt(ctx.match[2], 10) || 0;
-  const chatId = ctx.callbackQuery?.message?.chat?.id;
-  if (!chatId) return ctx.answerCbQuery("Ошибка");
-  const isAdminUser = await isAdmin(ctx, ctx.from.id);
-  if (!isAdminUser) return ctx.answerCbQuery("Только админы.");
-  const cid = String(chatId);
-  const candidates = selectChatMembersNotInTeamStmt.all(cid, cid, slug);
-  const totalPages = Math.max(1, Math.ceil(candidates.length / TEAM_ADD_PAGE_SIZE));
-  const p = Math.min(page, totalPages - 1);
-  const start = p * TEAM_ADD_PAGE_SIZE;
-  const pageCandidates = candidates.slice(start, start + TEAM_ADD_PAGE_SIZE);
-  const rows = [];
-  for (const u of pageCandidates) {
-    rows.push([{ text: "+ " + shortNameForButton(u), callback_data: `t_add_one:${slug}:${u.user_id}` }]);
-  }
-  const nav = [];
-  if (totalPages > 1) {
-    if (p > 0) nav.push({ text: "◀ Назад", callback_data: `t_add:${slug}:${p - 1}` });
-    nav.push({ text: `Стр. ${p + 1}/${totalPages}`, callback_data: `t_add:${slug}:${p}` });
-    if (p < totalPages - 1) nav.push({ text: "Вперёд ▶", callback_data: `t_add:${slug}:${p + 1}` });
-  }
-  rows.push(nav.length ? nav : [{ text: "← К меню", callback_data: `t_back:${slug}` }]);
-  if (nav.length) rows.push([{ text: "← К меню", callback_data: `t_back:${slug}` }]);
-  const text = candidates.length
-    ? `Команда /${slug}. Добавить (стр. ${p + 1}):`
-    : `Команда /${slug}. Нет участников чата для добавления.`;
-  await ctx.answerCbQuery();
-  await ctx.editMessageText(text, { reply_markup: { inline_keyboard: rows } }).catch(() => {});
-});
-
-bot.action(/^t_back:([^:]+)$/, async (ctx) => {
-  const slug = ctx.match[1];
-  const chatId = ctx.callbackQuery?.message?.chat?.id;
-  if (!chatId) return ctx.answerCbQuery();
-  await editToManageMain(ctx, String(chatId), slug);
-});
-
-bot.action(/^t_add_one:([^:]+):(\d+)$/, async (ctx) => {
-  const slug = ctx.match[1];
-  const userId = parseInt(ctx.match[2], 10);
-  const chatId = ctx.callbackQuery?.message?.chat?.id;
-  if (!chatId) return ctx.answerCbQuery("Ошибка");
-  const isAdminUser = await isAdmin(ctx, ctx.from.id);
-  if (!isAdminUser) return ctx.answerCbQuery("Только админы.");
-  const cid = String(chatId);
-  try {
-    insertTeamMemberStmt.run(cid, slug, userId);
-  } catch (e) {
-    // already in team
-  }
-  await ctx.answerCbQuery("Добавлен");
-  const candidates = selectChatMembersNotInTeamStmt.all(cid, cid, slug);
-  const totalPages = Math.max(1, Math.ceil(candidates.length / TEAM_ADD_PAGE_SIZE));
-  const p = 0;
-  const start = 0;
-  const pageCandidates = candidates.slice(start, start + TEAM_ADD_PAGE_SIZE);
-  const rows = [];
-  for (const u of pageCandidates) {
-    rows.push([{ text: "+ " + shortNameForButton(u), callback_data: `t_add_one:${slug}:${u.user_id}` }]);
-  }
-  const nav = [];
-  if (totalPages > 1) {
-    nav.push({ text: "Вперёд ▶", callback_data: `t_add:${slug}:1` });
-  }
-  rows.push([{ text: "← К меню", callback_data: `t_back:${slug}` }]);
-  if (nav.length) rows.push(nav);
-  const n = getTeamMemberCount(cid, slug);
-  const text = candidates.length
-    ? `Команда /${slug}. Участников: ${n}. Добавить (стр. 1):`
-    : `Команда /${slug}. Участников: ${n}. Нет ещё кого добавить.`;
-  await ctx.editMessageText(text, { reply_markup: { inline_keyboard: rows } }).catch(() => {});
-});
-
-bot.action(/^t_rem:([^:]+):(\d+)$/, async (ctx) => {
-  const slug = ctx.match[1];
-  const page = parseInt(ctx.match[2], 10) || 0;
-  const chatId = ctx.callbackQuery?.message?.chat?.id;
-  if (!chatId) return ctx.answerCbQuery("Ошибка");
-  const isAdminUser = await isAdmin(ctx, ctx.from.id);
-  if (!isAdminUser) return ctx.answerCbQuery("Только админы.");
-  const cid = String(chatId);
-  const members = selectTeamMembersForRemovalStmt.all(cid, slug);
-  const totalPages = Math.max(1, Math.ceil(members.length / TEAM_REM_PAGE_SIZE));
-  const p = Math.min(page, totalPages - 1);
-  const start = p * TEAM_REM_PAGE_SIZE;
-  const pageMembers = members.slice(start, start + TEAM_REM_PAGE_SIZE);
-  const rows = [];
-  for (const u of pageMembers) {
-    rows.push([{ text: "− " + shortNameForButton(u), callback_data: `t_rem_one:${slug}:${u.user_id}` }]);
-  }
-  const nav = [];
-  if (totalPages > 1) {
-    if (p > 0) nav.push({ text: "◀ Назад", callback_data: `t_rem:${slug}:${p - 1}` });
-    nav.push({ text: `Стр. ${p + 1}/${totalPages}`, callback_data: `t_rem:${slug}:${p}` });
-    if (p < totalPages - 1) nav.push({ text: "Вперёд ▶", callback_data: `t_rem:${slug}:${p + 1}` });
-  }
-  rows.push(nav.length ? nav : [{ text: "← К меню", callback_data: `t_back:${slug}` }]);
-  if (nav.length) rows.push([{ text: "← К меню", callback_data: `t_back:${slug}` }]);
-  const text = members.length
-    ? `Команда /${slug}. Убрать (стр. ${p + 1}):`
-    : `Команда /${slug}. В команде никого.`;
-  await ctx.answerCbQuery();
-  await ctx.editMessageText(text, { reply_markup: { inline_keyboard: rows } }).catch(() => {});
-});
-
-bot.action(/^t_rem_one:([^:]+):(\d+)$/, async (ctx) => {
-  const slug = ctx.match[1];
-  const userId = parseInt(ctx.match[2], 10);
-  const chatId = ctx.callbackQuery?.message?.chat?.id;
-  if (!chatId) return ctx.answerCbQuery("Ошибка");
-  const isAdminUser = await isAdmin(ctx, ctx.from.id);
-  if (!isAdminUser) return ctx.answerCbQuery("Только админы.");
-  const cid = String(chatId);
-  deleteTeamMemberStmt.run(cid, slug, userId);
-  await ctx.answerCbQuery("Убран");
-  const members = selectTeamMembersForRemovalStmt.all(cid, slug);
-  const totalPages = Math.max(1, Math.ceil(members.length / TEAM_REM_PAGE_SIZE));
-  const p = 0;
-  const start = 0;
-  const pageMembers = members.slice(start, start + TEAM_REM_PAGE_SIZE);
-  const rows = [];
-  for (const u of pageMembers) {
-    rows.push([{ text: "− " + shortNameForButton(u), callback_data: `t_rem_one:${slug}:${u.user_id}` }]);
-  }
-  const nav = [];
-  if (totalPages > 1) {
-    nav.push({ text: "Вперёд ▶", callback_data: `t_rem:${slug}:1` });
-  }
-  rows.push([{ text: "← К меню", callback_data: `t_back:${slug}` }]);
-  if (nav.length) rows.push(nav);
-  const n = getTeamMemberCount(cid, slug);
-  const text = members.length
-    ? `Команда /${slug}. Участников: ${n}. Убрать (стр. 1):`
-    : `Команда /${slug}. Участников: ${n}.`;
-  await ctx.editMessageText(text, { reply_markup: { inline_keyboard: rows } }).catch(() => {});
-});
 
 async function sendMentionChunks(ctx, chatId, targetMessageId, members) {
   const chunks = [];
@@ -596,7 +1051,7 @@ bot.on("message", async (ctx, next) => {
     }
     const members = selectTeamMembersStmt.all(chatId, cmd);
     if (!members.length) {
-      await ctx.reply(`В команде /${cmd} пока никого. Добавь участников: /manage ${cmd}`);
+      await ctx.reply(`В команде /${cmd} пока никого. Добавь участников через /admin → Подгруппы.`);
       return;
     }
     setCooldown(chatId);
