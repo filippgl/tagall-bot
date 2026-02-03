@@ -10,12 +10,24 @@ if (!BOT_TOKEN) {
 }
 
 const DB_PATH = process.env.DB_PATH || "./members.db";
+const MAX_USERS = Math.max(1, parseInt(process.env.TAGALL_MAX_USERS, 10) || 100);
+const CHUNK = Math.max(1, parseInt(process.env.TAGALL_CHUNK_SIZE, 10) || 20);
+const DELAY_MS = Math.max(0, parseInt(process.env.TAGALL_DELAY_MS, 10) || 1200);
+const COOLDOWN_SEC = Math.max(0, parseInt(process.env.TAGALL_COOLDOWN_SEC, 10) || 60);
+const MENTION_SEPARATOR = " | ";
 
 const bot = new Telegraf(BOT_TOKEN);
 
 // -------------------- DB --------------------
 const db = new Database(DB_PATH);
 db.pragma("journal_mode = WAL");
+
+try {
+  db.prepare("SELECT 1").get();
+} catch (e) {
+  console.error("❌ DB unavailable:", e?.message || e);
+  process.exit(1);
+}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS chat_members (
@@ -32,6 +44,11 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_chat_members_chat_first_seen
     ON chat_members(chat_id, first_seen);
+
+  CREATE TABLE IF NOT EXISTS chat_settings (
+    chat_id            TEXT NOT NULL PRIMARY KEY,
+    tagall_only_admins INTEGER NOT NULL DEFAULT 1
+  );
 `);
 
 const upsertMemberStmt = db.prepare(`
@@ -54,6 +71,35 @@ const selectMembersStmt = db.prepare(`
   LIMIT ?
 `);
 
+const getTagallOnlyAdminsStmt = db.prepare(`
+  SELECT tagall_only_admins FROM chat_settings WHERE chat_id = ?
+`);
+const setTagallOnlyAdminsStmt = db.prepare(`
+  INSERT INTO chat_settings (chat_id, tagall_only_admins) VALUES (?, ?)
+  ON CONFLICT(chat_id) DO UPDATE SET tagall_only_admins = excluded.tagall_only_admins
+`);
+
+function getTagallOnlyAdmins(chatId) {
+  const row = getTagallOnlyAdminsStmt.get(String(chatId));
+  return row == null ? true : row.tagall_only_admins !== 0;
+}
+
+// -------------------- Cooldown --------------------
+const tagallLastRun = new Map();
+
+function checkCooldown(chatId) {
+  if (COOLDOWN_SEC <= 0) return null;
+  const last = tagallLastRun.get(String(chatId));
+  if (!last) return null;
+  const elapsed = (Date.now() - last) / 1000;
+  if (elapsed < COOLDOWN_SEC) return Math.ceil(COOLDOWN_SEC - elapsed);
+  return null;
+}
+
+function setCooldown(chatId) {
+  tagallLastRun.set(String(chatId), Date.now());
+}
+
 // -------------------- Helpers --------------------
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -68,7 +114,6 @@ function escapeHtml(s = "") {
 }
 
 function displayName(u) {
-  // Приоритет: first_name last_name -> @username -> id
   const full =
     [u.first_name, u.last_name].filter(Boolean).join(" ").trim();
   if (full) return full;
@@ -110,7 +155,6 @@ function storeUser(chatId, user) {
 }
 
 // -------------------- Collect members --------------------
-// Любое сообщение: сохраняем автора (если бота видно).
 bot.on("message", async (ctx, next) => {
   if (ctx.from && ctx.chat?.id) {
     storeUser(ctx.chat.id, ctx.from);
@@ -118,7 +162,6 @@ bot.on("message", async (ctx, next) => {
   return next();
 });
 
-// Событие вступления новых участников (если приходит апдейт)
 bot.on("new_chat_members", async (ctx) => {
   const chatId = ctx.chat?.id;
   const members = ctx.message?.new_chat_members || [];
@@ -134,30 +177,83 @@ bot.start(async (ctx) => {
   );
 });
 
+bot.command("ping", async (ctx) => {
+  try {
+    db.prepare("SELECT 1").get();
+    await ctx.reply("OK");
+  } catch (e) {
+    await ctx.reply("Ошибка БД");
+  }
+});
+
+bot.command("admin", async (ctx) => {
+  if (!isGroupChat(ctx)) {
+    return ctx.reply("Команда только для групп.");
+  }
+  const ok = await isAdmin(ctx, ctx.from.id);
+  if (!ok) {
+    return ctx.reply("⛔️ Только админы группы могут менять настройки.");
+  }
+  const chatId = ctx.chat.id;
+  const onlyAdmins = getTagallOnlyAdmins(chatId);
+  await ctx.reply("Кто может использовать /tagall?", {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: onlyAdmins ? "✓ Только админы" : "Только админы", callback_data: "tagall_who:admins" },
+          { text: !onlyAdmins ? "✓ Все участники" : "Все участники", callback_data: "tagall_who:all" }
+        ]
+      ]
+    }
+  });
+});
+
+bot.action(/^tagall_who:(admins|all)$/, async (ctx) => {
+  const who = ctx.match[1];
+  const chatId = ctx.chat?.id || ctx.callbackQuery?.message?.chat?.id;
+  if (!chatId) return ctx.answerCbQuery("Ошибка");
+  const isAdminUser = await isAdmin(ctx, ctx.from.id);
+  if (!isAdminUser) {
+    return ctx.answerCbQuery("Только админы могут менять настройки.");
+  }
+  const onlyAdmins = who === "admins" ? 1 : 0;
+  setTagallOnlyAdminsStmt.run(String(chatId), onlyAdmins);
+  const onlyAdminsNow = getTagallOnlyAdmins(chatId);
+  await ctx.answerCbQuery();
+  await ctx.editMessageReplyMarkup({
+    inline_keyboard: [
+      [
+        { text: onlyAdminsNow ? "✓ Только админы" : "Только админы", callback_data: "tagall_who:admins" },
+        { text: !onlyAdminsNow ? "✓ Все участники" : "Все участники", callback_data: "tagall_who:all" }
+      ]
+    ]
+  }).catch(() => {});
+});
+
 bot.command("tagall", async (ctx) => {
   try {
     if (!isGroupChat(ctx)) {
       return ctx.reply("Команда работает только в группах.");
     }
 
-    // Команда должна быть reply на важное сообщение
     const replied = ctx.message?.reply_to_message;
     if (!replied) {
       return ctx.reply("Использование: ответь (reply) на важное сообщение и напиши /tagall");
     }
 
-    // Проверка админа
-    const ok = await isAdmin(ctx, ctx.from.id);
-    if (!ok) {
-      return ctx.reply("⛔️ Команда доступна только админам группы.");
+    const chatId = ctx.chat.id;
+    const onlyAdmins = getTagallOnlyAdmins(chatId);
+    if (onlyAdmins) {
+      const ok = await isAdmin(ctx, ctx.from.id);
+      if (!ok) {
+        return ctx.reply("⛔️ Команда доступна только админам группы.");
+      }
     }
 
-    const chatId = ctx.chat.id;
-    const targetMessageId = replied.message_id;
-
-    // Берём максимум 100 "первых по порядку" (first_seen ASC)
-    const MAX_USERS = 100;
-    const CHUNK = 20;
+    const waitSec = checkCooldown(chatId);
+    if (waitSec != null) {
+      return ctx.reply(`Подожди ещё ${waitSec} сек. перед следующим /tagall.`);
+    }
 
     const members = selectMembersStmt.all(String(chatId), MAX_USERS);
 
@@ -165,15 +261,17 @@ bot.command("tagall", async (ctx) => {
       return ctx.reply("Пока некого упоминать: я ещё не собрал базу участников.");
     }
 
-    // Формируем чанки по 20
     const chunks = [];
     for (let i = 0; i < members.length; i += CHUNK) {
       chunks.push(members.slice(i, i + CHUNK));
     }
 
-    // Отправляем: каждый чанк — отдельное сообщение-реплай на важное
+    const targetMessageId = replied.message_id;
+    setCooldown(chatId);
+    console.log(`tagall chat=${chatId} members=${members.length} chunks=${chunks.length}`);
+
     for (let i = 0; i < chunks.length; i++) {
-      const text = chunks[i].map(mentionHtml).join("  ");
+      const text = chunks[i].map(mentionHtml).join(MENTION_SEPARATOR);
 
       try {
         await ctx.telegram.sendMessage(chatId, text, {
@@ -183,20 +281,18 @@ bot.command("tagall", async (ctx) => {
           allow_sending_without_reply: true
         });
       } catch (e) {
-        // Если поймали 429 — подождём retry_after и продолжим
         const retryAfter = e?.parameters?.retry_after;
         if (retryAfter) {
-          console.warn(`Rate limit: retry_after=${retryAfter}s`);
+          console.warn(`tagall rate limit chat=${chatId} retry_after=${retryAfter}s`);
           await sleep((retryAfter + 1) * 1000);
-          i--; // повторим отправку этого же чанка
+          i--;
           continue;
         }
         throw e;
       }
 
-      // Бережный интервал между сообщениями, чтобы не ловить лимиты
       if (i < chunks.length - 1) {
-        await sleep(1200);
+        await sleep(DELAY_MS);
       }
     }
   } catch (e) {
@@ -213,6 +309,5 @@ bot.launch()
     process.exit(1);
   });
 
-// Graceful stop
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
