@@ -1,0 +1,8 @@
+# filename: .gitignore
+node_modules/
+.env
+members.db
+*.db
+*.db-shm
+*.db-wal
+pm2.log

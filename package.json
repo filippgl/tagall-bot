@@ -1,0 +1,15 @@
+{
+  "name": "tagall-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot: /tagall in reply, mentions up to 100 users in chunks of 20",
+  "main": "bot.js",
+  "type": "module",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "dotenv": "^16.4.5",
+    "telegraf": "^4.16.3"
+  }
+}
