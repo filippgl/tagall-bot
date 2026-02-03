@@ -99,6 +99,7 @@ function getTagallOnlyAdmins(chatId) {
 
 // Teams
 const distinctChatIdsStmt = db.prepare(`SELECT DISTINCT chat_id FROM chat_members`);
+const distinctChatIdsFromTeamsStmt = db.prepare(`SELECT DISTINCT chat_id FROM chat_teams`);
 const insertTeamStmt = db.prepare(`INSERT INTO chat_teams (chat_id, slug) VALUES (?, ?)`);
 const getTeamStmt = db.prepare(`SELECT 1 FROM chat_teams WHERE chat_id = ? AND slug = ?`);
 const listTeamsStmt = db.prepare(`SELECT slug FROM chat_teams WHERE chat_id = ? ORDER BY slug`);
@@ -195,6 +196,15 @@ function shortNameForButton(u) {
   return name.slice(0, TEAM_BUTTON_NAME_MAX - 1) + "…";
 }
 
+const TEAM_BUTTON_WITH_USERNAME_MAX = 48;
+
+function shortNameWithUsername(u) {
+  const name = displayName(u);
+  const withUsername = u.username ? `${name} (@${u.username})` : name;
+  if (withUsername.length <= TEAM_BUTTON_WITH_USERNAME_MAX) return withUsername;
+  return withUsername.slice(0, TEAM_BUTTON_WITH_USERNAME_MAX - 1) + "…";
+}
+
 function mentionHtml(u) {
   const label = escapeHtml(displayName(u));
   return `<a href="tg://user?id=${u.user_id}">${label}</a>`;
@@ -265,7 +275,7 @@ bot.on("message", async (ctx, next) => {
             [{ text: "← К списку команд", callback_data: isPrivate ? CB.teams(cid) : CB.teams(null) }]
           ]
         };
-        await ctx.telegram.editMessageText(state.msgChatId, state.msgId, null, `Команда /${text} создана.`, kbd).catch(() => {});
+        await ctx.telegram.editMessageText(state.msgChatId, state.msgId, null, `Команда /${text} создана.`, { reply_markup: kbd }).catch(() => {});
       } else {
         await ctx.reply(`Команда /${text} создана. Настрой через /admin.`);
       }
@@ -281,7 +291,7 @@ bot.on("message", async (ctx, next) => {
         adminInputState.delete(ctx.from.id);
         if (state.msgChatId != null && state.msgId != null) {
           const n = getTeamMemberCount(cid, oldSlug);
-          await ctx.telegram.editMessageText(state.msgChatId, state.msgId, null, `Команда /${oldSlug}. Участников: ${n}`, buildTeamScreenKeyboard(isPrivate, isPrivate ? cid : null, oldSlug)).catch(() => {});
+          await ctx.telegram.editMessageText(state.msgChatId, state.msgId, null, `Команда /${oldSlug}. Участников: ${n}`, { reply_markup: buildTeamScreenKeyboard(isPrivate, isPrivate ? cid : null, oldSlug) }).catch(() => {});
         }
         return;
       }
@@ -294,7 +304,7 @@ bot.on("message", async (ctx, next) => {
       adminInputState.delete(ctx.from.id);
       if (state.msgChatId != null && state.msgId != null) {
         const n = getTeamMemberCount(cid, text);
-        await ctx.telegram.editMessageText(state.msgChatId, state.msgId, null, `Команда /${text}. Участников: ${n}`, buildTeamScreenKeyboard(isPrivate, isPrivate ? cid : null, text)).catch(() => {});
+        await ctx.telegram.editMessageText(state.msgChatId, state.msgId, null, `Команда /${text}. Участников: ${n}`, { reply_markup: buildTeamScreenKeyboard(isPrivate, isPrivate ? cid : null, text) }).catch(() => {});
       } else {
         await ctx.reply(`Переименовано в /${text}.`);
       }
@@ -404,10 +414,11 @@ async function getChatTitleSafe(ctx, chatId) {
 
 bot.command("admin", async (ctx) => {
   if (ctx.chat.type === "private") {
-    const rows = distinctChatIdsStmt.all();
+    const fromMembers = distinctChatIdsStmt.all().map((r) => r.chat_id);
+    const fromTeams = distinctChatIdsFromTeamsStmt.all().map((r) => r.chat_id);
+    const allChatIds = [...new Set([...fromMembers, ...fromTeams])];
     const allowed = [];
-    for (const r of rows) {
-      const cid = r.chat_id;
+    for (const cid of allChatIds) {
       const ok = await isAdminInChat(ctx, cid, ctx.from.id);
       if (ok) allowed.push({ chatId: cid, title: await getChatTitleSafe(ctx, cid) });
     }
@@ -415,27 +426,29 @@ bot.command("admin", async (ctx) => {
     const keyboard = {
       inline_keyboard: allowed.map((g) => [{ text: g.title, callback_data: CB.grp(g.chatId) }])
     };
-    return ctx.reply("Выбери группу:", keyboard);
+    return ctx.reply("Выбери группу:", { reply_markup: keyboard });
   }
   if (!isGroupChat(ctx)) return ctx.reply("Команда только для групп.");
   const ok = await isAdmin(ctx, ctx.from.id);
   if (!ok) return ctx.reply("⛔️ Только админы группы могут менять настройки.");
-  await ctx.reply("Настройки группы", buildMainMenuKeyboard(false, null));
+  await ctx.reply("Настройки группы", { reply_markup: buildMainMenuKeyboard(false, null) });
 });
 
 bot.action(/^adm_list$/, async (ctx) => {
   if (ctx.callbackQuery.message.chat.type !== "private") return ctx.answerCbQuery();
-  const rows = distinctChatIdsStmt.all();
+  const fromMembers = distinctChatIdsStmt.all().map((r) => r.chat_id);
+  const fromTeams = distinctChatIdsFromTeamsStmt.all().map((r) => r.chat_id);
+  const allChatIds = [...new Set([...fromMembers, ...fromTeams])];
   const allowed = [];
-  for (const r of rows) {
-    const ok = await isAdminInChat(ctx, r.chat_id, ctx.from.id);
-    if (ok) allowed.push({ chatId: r.chat_id, title: await getChatTitleSafe(ctx, r.chat_id) });
+  for (const cid of allChatIds) {
+    const ok = await isAdminInChat(ctx, cid, ctx.from.id);
+    if (ok) allowed.push({ chatId: cid, title: await getChatTitleSafe(ctx, cid) });
   }
   const keyboard = {
     inline_keyboard: allowed.map((g) => [{ text: g.title, callback_data: CB.grp(g.chatId) }])
   };
   await ctx.answerCbQuery();
-  await ctx.editMessageText("Выбери группу:", keyboard).catch(() => {});
+  await ctx.editMessageText("Выбери группу:", { reply_markup: keyboard }).catch(() => {});
 });
 
 bot.action(/^adm_grp:(-?\d+)$/, async (ctx) => {
@@ -445,13 +458,13 @@ bot.action(/^adm_grp:(-?\d+)$/, async (ctx) => {
   if (!ok) return ctx.answerCbQuery("Нет прав в этой группе.");
   const title = await getChatTitleSafe(ctx, chatId);
   await ctx.answerCbQuery();
-  await ctx.editMessageText(`Настройки: ${title}`, buildMainMenuKeyboard(true, chatId)).catch(() => {});
+  await ctx.editMessageText(`Настройки: ${title}`, { reply_markup: buildMainMenuKeyboard(true, chatId) }).catch(() => {});
 });
 
 bot.action(/^adm_menu$/, async (ctx) => {
   if (ctx.chat?.type !== "group" && ctx.chat?.type !== "supergroup") return ctx.answerCbQuery();
   await ctx.answerCbQuery();
-  await ctx.editMessageText("Настройки группы", buildMainMenuKeyboard(false, null)).catch(() => {});
+  await ctx.editMessageText("Настройки группы", { reply_markup: buildMainMenuKeyboard(false, null) }).catch(() => {});
 });
 
 bot.action(/^adm_menu:(.+)$/, async (ctx) => {
@@ -461,7 +474,7 @@ bot.action(/^adm_menu:(.+)$/, async (ctx) => {
   if (!ok) return ctx.answerCbQuery("Нет прав.");
   const title = await getChatTitleSafe(ctx, chatId);
   await ctx.answerCbQuery();
-  await ctx.editMessageText(`Настройки: ${title}`, buildMainMenuKeyboard(true, chatId)).catch(() => {});
+  await ctx.editMessageText(`Настройки: ${title}`, { reply_markup: buildMainMenuKeyboard(true, chatId) }).catch(() => {});
 });
 
 bot.action(/^adm_close$/, async (ctx) => {
@@ -475,7 +488,7 @@ bot.action(/^adm_tag$/, async (ctx) => {
   const ok = await isAdmin(ctx, ctx.from.id);
   if (!ok) return ctx.answerCbQuery("Только админы.");
   await ctx.answerCbQuery();
-  await ctx.editMessageText("Кто может использовать /tagall и команды?", buildWhoKeyboard(false, chatId)).catch(() => {});
+  await ctx.editMessageText("Кто может использовать /tagall и команды?", { reply_markup: buildWhoKeyboard(false, chatId) }).catch(() => {});
 });
 
 bot.action(/^adm_tag:(.+)$/, async (ctx) => {
@@ -484,7 +497,7 @@ bot.action(/^adm_tag:(.+)$/, async (ctx) => {
   const ok = await isAdminInChat(ctx, chatId, ctx.from.id);
   if (!ok) return ctx.answerCbQuery("Нет прав.");
   await ctx.answerCbQuery();
-  await ctx.editMessageText("Кто может использовать /tagall и команды?", buildWhoKeyboard(true, chatId)).catch(() => {});
+  await ctx.editMessageText("Кто может использовать /tagall и команды?", { reply_markup: buildWhoKeyboard(true, chatId) }).catch(() => {});
 });
 
 bot.action(/^adm_who:(admins|all)$/, async (ctx) => {
@@ -495,7 +508,7 @@ bot.action(/^adm_who:(admins|all)$/, async (ctx) => {
   if (!ok) return ctx.answerCbQuery("Только админы.");
   setTagallOnlyAdminsStmt.run(String(chatId), who === "admins" ? 1 : 0);
   await ctx.answerCbQuery();
-  await ctx.editMessageText("Настройки группы", buildMainMenuKeyboard(false, null)).catch(() => {});
+  await ctx.editMessageText("Настройки группы", { reply_markup: buildMainMenuKeyboard(false, null) }).catch(() => {});
 });
 
 bot.action(/^adm_who:(.+):(admins|all)$/, async (ctx) => {
@@ -507,7 +520,7 @@ bot.action(/^adm_who:(.+):(admins|all)$/, async (ctx) => {
   setTagallOnlyAdminsStmt.run(String(chatId), who === "admins" ? 1 : 0);
   await ctx.answerCbQuery();
   const title = await getChatTitleSafe(ctx, chatId);
-  await ctx.editMessageText(`Настройки: ${title}`, buildMainMenuKeyboard(true, chatId)).catch(() => {});
+  await ctx.editMessageText(`Настройки: ${title}`, { reply_markup: buildMainMenuKeyboard(true, chatId) }).catch(() => {});
 });
 
 bot.action(/^adm_teams$/, async (ctx) => {
@@ -524,7 +537,7 @@ bot.action(/^adm_teams$/, async (ctx) => {
   rows.push([{ text: "➕ Создать команду", callback_data: CB.newteam(null) }]);
   rows.push([{ text: "← Назад", callback_data: CB.menu(null) }]);
   await ctx.answerCbQuery();
-  await ctx.editMessageText("Подгруппы (команды):", { inline_keyboard: rows }).catch(() => {});
+  await ctx.editMessageText("Подгруппы (команды):", { reply_markup: { inline_keyboard: rows } }).catch(() => {});
 });
 
 bot.action(/^adm_teams:(.+)$/, async (ctx) => {
@@ -542,7 +555,7 @@ bot.action(/^adm_teams:(.+)$/, async (ctx) => {
   rows.push([{ text: "← Назад", callback_data: CB.menu(chatId) }]);
   await ctx.answerCbQuery();
   const title = await getChatTitleSafe(ctx, chatId);
-  await ctx.editMessageText(`${title}\nПодгруппы (команды):`, { inline_keyboard: rows }).catch(() => {});
+  await ctx.editMessageText(`${title}\nПодгруппы (команды):`, { reply_markup: { inline_keyboard: rows } }).catch(() => {});
 });
 
 bot.action(/^adm_team:([^:]+)$/, async (ctx) => {
@@ -555,7 +568,7 @@ bot.action(/^adm_team:([^:]+)$/, async (ctx) => {
   if (!getTeamStmt.get(cid, slug)) return ctx.answerCbQuery("Команда не найдена.");
   const n = getTeamMemberCount(cid, slug);
   await ctx.answerCbQuery();
-  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, buildTeamScreenKeyboard(false, null, slug)).catch(() => {});
+  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, { reply_markup: buildTeamScreenKeyboard(false, null, slug) }).catch(() => {});
 });
 
 bot.action(/^adm_team:(.+):([^:]+)$/, async (ctx) => {
@@ -568,7 +581,7 @@ bot.action(/^adm_team:(.+):([^:]+)$/, async (ctx) => {
   if (!getTeamStmt.get(cid, slug)) return ctx.answerCbQuery("Команда не найдена.");
   const n = getTeamMemberCount(cid, slug);
   await ctx.answerCbQuery();
-  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, buildTeamScreenKeyboard(true, chatId, slug)).catch(() => {});
+  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, { reply_markup: buildTeamScreenKeyboard(true, chatId, slug) }).catch(() => {});
 });
 
 function buildAddPageKeyboard(cid, slug, page, isPrivate) {
@@ -577,7 +590,7 @@ function buildAddPageKeyboard(cid, slug, page, isPrivate) {
   const p = Math.min(page, totalPages - 1);
   const start = p * TEAM_ADD_PAGE_SIZE;
   const pageCandidates = candidates.slice(start, start + TEAM_ADD_PAGE_SIZE);
-  const rows = pageCandidates.map((u) => [{ text: "+ " + shortNameForButton(u), callback_data: CB.add1(isPrivate ? cid : null, slug, u.user_id) }]);
+  const rows = pageCandidates.map((u) => [{ text: "+ " + shortNameWithUsername(u), callback_data: CB.add1(isPrivate ? cid : null, slug, u.user_id) }]);
   const nav = [];
   if (totalPages > 1) {
     if (p > 0) nav.push({ text: "◀", callback_data: CB.add(isPrivate ? cid : null, slug, p - 1) });
@@ -595,7 +608,7 @@ function buildRemPageKeyboard(cid, slug, page, isPrivate) {
   const p = Math.min(page, totalPages - 1);
   const start = p * TEAM_REM_PAGE_SIZE;
   const pageMembers = members.slice(start, start + TEAM_REM_PAGE_SIZE);
-  const rows = pageMembers.map((u) => [{ text: "− " + shortNameForButton(u), callback_data: CB.rem1(isPrivate ? cid : null, slug, u.user_id) }]);
+  const rows = pageMembers.map((u) => [{ text: "− " + shortNameWithUsername(u), callback_data: CB.rem1(isPrivate ? cid : null, slug, u.user_id) }]);
   const nav = [];
   if (totalPages > 1) {
     if (p > 0) nav.push({ text: "◀", callback_data: CB.rem(isPrivate ? cid : null, slug, p - 1) });
@@ -618,7 +631,7 @@ bot.action(/^adm_add:([^:]+):(\d+)$/, async (ctx) => {
   const { rows, candidates, p, totalPages } = buildAddPageKeyboard(cid, slug, page, false);
   const text = candidates.length ? `Команда /${slug}. Добавить (стр. ${p + 1}/${totalPages}):` : `Команда /${slug}. Нет кого добавить.`;
   await ctx.answerCbQuery();
-  await ctx.editMessageText(text, { inline_keyboard: rows }).catch(() => {});
+  await ctx.editMessageText(text, { reply_markup: { inline_keyboard: rows } }).catch(() => {});
 });
 
 bot.action(/^adm_add:(.+):([^:]+):(\d+)$/, async (ctx) => {
@@ -632,7 +645,7 @@ bot.action(/^adm_add:(.+):([^:]+):(\d+)$/, async (ctx) => {
   const { rows, candidates, p, totalPages } = buildAddPageKeyboard(cid, slug, page, true);
   const text = candidates.length ? `Команда /${slug}. Добавить (стр. ${p + 1}/${totalPages}):` : `Команда /${slug}. Нет кого добавить.`;
   await ctx.answerCbQuery();
-  await ctx.editMessageText(text, { inline_keyboard: rows }).catch(() => {});
+  await ctx.editMessageText(text, { reply_markup: { inline_keyboard: rows } }).catch(() => {});
 });
 
 bot.action(/^adm_rem:([^:]+):(\d+)$/, async (ctx) => {
@@ -646,7 +659,7 @@ bot.action(/^adm_rem:([^:]+):(\d+)$/, async (ctx) => {
   const { rows, members, p, totalPages } = buildRemPageKeyboard(cid, slug, page, false);
   const text = members.length ? `Команда /${slug}. Убрать (стр. ${p + 1}/${totalPages}):` : `Команда /${slug}. В команде никого.`;
   await ctx.answerCbQuery();
-  await ctx.editMessageText(text, { inline_keyboard: rows }).catch(() => {});
+  await ctx.editMessageText(text, { reply_markup: { inline_keyboard: rows } }).catch(() => {});
 });
 
 bot.action(/^adm_rem:(.+):([^:]+):(\d+)$/, async (ctx) => {
@@ -660,7 +673,7 @@ bot.action(/^adm_rem:(.+):([^:]+):(\d+)$/, async (ctx) => {
   const { rows, members, p, totalPages } = buildRemPageKeyboard(cid, slug, page, true);
   const text = members.length ? `Команда /${slug}. Убрать (стр. ${p + 1}/${totalPages}):` : `Команда /${slug}. В команде никого.`;
   await ctx.answerCbQuery();
-  await ctx.editMessageText(text, { inline_keyboard: rows }).catch(() => {});
+  await ctx.editMessageText(text, { reply_markup: { inline_keyboard: rows } }).catch(() => {});
 });
 
 bot.action(/^adm_a1:([^:]+):(\d+)$/, async (ctx) => {
@@ -674,7 +687,7 @@ bot.action(/^adm_a1:([^:]+):(\d+)$/, async (ctx) => {
   try { insertTeamMemberStmt.run(cid, slug, userId); } catch (e) {}
   await ctx.answerCbQuery("Добавлен");
   const n = getTeamMemberCount(cid, slug);
-  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, buildTeamScreenKeyboard(false, null, slug)).catch(() => {});
+  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, { reply_markup: buildTeamScreenKeyboard(false, null, slug) }).catch(() => {});
 });
 
 bot.action(/^adm_a1:(.+):([^:]+):(\d+)$/, async (ctx) => {
@@ -688,7 +701,7 @@ bot.action(/^adm_a1:(.+):([^:]+):(\d+)$/, async (ctx) => {
   try { insertTeamMemberStmt.run(cid, slug, userId); } catch (e) {}
   await ctx.answerCbQuery("Добавлен");
   const n = getTeamMemberCount(cid, slug);
-  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, buildTeamScreenKeyboard(true, chatId, slug)).catch(() => {});
+  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, { reply_markup: buildTeamScreenKeyboard(true, chatId, slug) }).catch(() => {});
 });
 
 bot.action(/^adm_r1:([^:]+):(\d+)$/, async (ctx) => {
@@ -702,7 +715,7 @@ bot.action(/^adm_r1:([^:]+):(\d+)$/, async (ctx) => {
   deleteTeamMemberStmt.run(cid, slug, userId);
   await ctx.answerCbQuery("Убран");
   const n = getTeamMemberCount(cid, slug);
-  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, buildTeamScreenKeyboard(false, null, slug)).catch(() => {});
+  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, { reply_markup: buildTeamScreenKeyboard(false, null, slug) }).catch(() => {});
 });
 
 bot.action(/^adm_r1:(.+):([^:]+):(\d+)$/, async (ctx) => {
@@ -716,7 +729,7 @@ bot.action(/^adm_r1:(.+):([^:]+):(\d+)$/, async (ctx) => {
   deleteTeamMemberStmt.run(cid, slug, userId);
   await ctx.answerCbQuery("Убран");
   const n = getTeamMemberCount(cid, slug);
-  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, buildTeamScreenKeyboard(true, chatId, slug)).catch(() => {});
+  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, { reply_markup: buildTeamScreenKeyboard(true, chatId, slug) }).catch(() => {});
 });
 
 bot.action(/^adm_back:([^:]+)$/, async (ctx) => {
@@ -726,7 +739,7 @@ bot.action(/^adm_back:([^:]+)$/, async (ctx) => {
   const cid = String(chatId);
   const n = getTeamMemberCount(cid, slug);
   await ctx.answerCbQuery();
-  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, buildTeamScreenKeyboard(false, null, slug)).catch(() => {});
+  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, { reply_markup: buildTeamScreenKeyboard(false, null, slug) }).catch(() => {});
 });
 
 bot.action(/^adm_back:(.+):([^:]+)$/, async (ctx) => {
@@ -738,7 +751,7 @@ bot.action(/^adm_back:(.+):([^:]+)$/, async (ctx) => {
   const cid = String(chatId);
   const n = getTeamMemberCount(cid, slug);
   await ctx.answerCbQuery();
-  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, buildTeamScreenKeyboard(true, chatId, slug)).catch(() => {});
+  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, { reply_markup: buildTeamScreenKeyboard(true, chatId, slug) }).catch(() => {});
 });
 
 bot.action(/^adm_ren:([^:]+)$/, async (ctx) => {
@@ -818,7 +831,7 @@ bot.action(/^adm_delok:([^:]+)$/, async (ctx) => {
   });
   rows.push([{ text: "➕ Создать команду", callback_data: CB.newteam(null) }]);
   rows.push([{ text: "← Назад", callback_data: CB.menu(null) }]);
-  await ctx.editMessageText("Подгруппы (команды):", { inline_keyboard: rows }).catch(() => {});
+  await ctx.editMessageText("Подгруппы (команды):", { reply_markup: { inline_keyboard: rows } }).catch(() => {});
 });
 
 bot.action(/^adm_delok:(.+):([^:]+)$/, async (ctx) => {
@@ -839,7 +852,7 @@ bot.action(/^adm_delok:(.+):([^:]+)$/, async (ctx) => {
   rows.push([{ text: "➕ Создать команду", callback_data: CB.newteam(chatId) }]);
   rows.push([{ text: "← Назад", callback_data: CB.menu(chatId) }]);
   const title = await getChatTitleSafe(ctx, chatId);
-  await ctx.editMessageText(`${title}\nПодгруппы (команды):`, { inline_keyboard: rows }).catch(() => {});
+  await ctx.editMessageText(`${title}\nПодгруппы (команды):`, { reply_markup: { inline_keyboard: rows } }).catch(() => {});
 });
 
 bot.action(/^adm_delno:([^:]+)$/, async (ctx) => {
@@ -849,7 +862,7 @@ bot.action(/^adm_delno:([^:]+)$/, async (ctx) => {
   const cid = String(chatId);
   const n = getTeamMemberCount(cid, slug);
   await ctx.answerCbQuery();
-  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, buildTeamScreenKeyboard(false, null, slug)).catch(() => {});
+  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, { reply_markup: buildTeamScreenKeyboard(false, null, slug) }).catch(() => {});
 });
 
 bot.action(/^adm_delno:(.+):([^:]+)$/, async (ctx) => {
@@ -859,7 +872,7 @@ bot.action(/^adm_delno:(.+):([^:]+)$/, async (ctx) => {
   const cid = String(chatId);
   const n = getTeamMemberCount(cid, slug);
   await ctx.answerCbQuery();
-  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, buildTeamScreenKeyboard(true, chatId, slug)).catch(() => {});
+  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, { reply_markup: buildTeamScreenKeyboard(true, chatId, slug) }).catch(() => {});
 });
 
 bot.action(/^adm_new$/, async (ctx) => {
@@ -901,7 +914,7 @@ bot.action(/^adm_cn$/, async (ctx) => {
   rows.push([{ text: "➕ Создать команду", callback_data: CB.newteam(null) }]);
   rows.push([{ text: "← Назад", callback_data: CB.menu(null) }]);
   await ctx.answerCbQuery();
-  await ctx.editMessageText("Подгруппы (команды):", { inline_keyboard: rows }).catch(() => {});
+  await ctx.editMessageText("Подгруппы (команды):", { reply_markup: { inline_keyboard: rows } }).catch(() => {});
 });
 
 bot.action(/^adm_cn:(.+)$/, async (ctx) => {
@@ -918,7 +931,7 @@ bot.action(/^adm_cn:(.+)$/, async (ctx) => {
   rows.push([{ text: "← Назад", callback_data: CB.menu(chatId) }]);
   const title = await getChatTitleSafe(ctx, chatId);
   await ctx.answerCbQuery();
-  await ctx.editMessageText(`${title}\nПодгруппы (команды):`, { inline_keyboard: rows }).catch(() => {});
+  await ctx.editMessageText(`${title}\nПодгруппы (команды):`, { reply_markup: { inline_keyboard: rows } }).catch(() => {});
 });
 
 bot.action(/^adm_cr:([^:]+)$/, async (ctx) => {
@@ -928,7 +941,7 @@ bot.action(/^adm_cr:([^:]+)$/, async (ctx) => {
   const cid = String(chatId);
   const n = getTeamMemberCount(cid, slug);
   await ctx.answerCbQuery();
-  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, buildTeamScreenKeyboard(false, null, slug)).catch(() => {});
+  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, { reply_markup: buildTeamScreenKeyboard(false, null, slug) }).catch(() => {});
 });
 
 bot.action(/^adm_cr:(.+):([^:]+)$/, async (ctx) => {
@@ -939,7 +952,7 @@ bot.action(/^adm_cr:(.+):([^:]+)$/, async (ctx) => {
   const cid = String(chatId);
   const n = getTeamMemberCount(cid, slug);
   await ctx.answerCbQuery();
-  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, buildTeamScreenKeyboard(true, chatId, slug)).catch(() => {});
+  await ctx.editMessageText(`Команда /${slug}. Участников: ${n}`, { reply_markup: buildTeamScreenKeyboard(true, chatId, slug) }).catch(() => {});
 });
 
 function getTeamMemberCount(chatId, slug) {
