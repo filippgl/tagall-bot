@@ -102,6 +102,9 @@ const distinctChatIdsStmt = db.prepare(`SELECT DISTINCT chat_id FROM chat_member
 const distinctChatIdsFromTeamsStmt = db.prepare(`SELECT DISTINCT chat_id FROM chat_teams`);
 const insertTeamStmt = db.prepare(`INSERT INTO chat_teams (chat_id, slug) VALUES (?, ?)`);
 const getTeamStmt = db.prepare(`SELECT 1 FROM chat_teams WHERE chat_id = ? AND slug = ?`);
+const getTeamSlugCaseInsensitiveStmt = db.prepare(`
+  SELECT slug FROM chat_teams WHERE chat_id = ? AND LOWER(slug) = LOWER(?) LIMIT 1
+`);
 const listTeamsStmt = db.prepare(`SELECT slug FROM chat_teams WHERE chat_id = ? ORDER BY slug`);
 const insertTeamMemberStmt = db.prepare(`
   INSERT INTO chat_team_members (chat_id, slug, user_id) VALUES (?, ?, ?)
@@ -182,6 +185,16 @@ const SLUG_MAX_LEN = 32;
 const SLUG_REGEX = /^[a-zA-Z0-9_]+$/;
 const TEAM_BUTTON_NAME_MAX = 28;
 
+function normalizeTeamSlugInput(input = "") {
+  let s = String(input).trim();
+  // принимаем "bar" и "/bar"
+  s = s.replace(/^\/+/, "");
+  // на всякий случай, если вставили "/bar@MyBot"
+  s = s.replace(/@[\w_]+$/i, "");
+  return s;
+}
+
+
 function displayName(u) {
   const full =
     [u.first_name, u.last_name].filter(Boolean).join(" ").trim();
@@ -254,7 +267,8 @@ bot.on("message", async (ctx, next) => {
   }
   const state = adminInputState.get(ctx.from.id);
   if (state && (state.step === "new_team_slug" || state.step === "rename_team") && ctx.message?.text) {
-    const text = ctx.message.text.trim();
+    const raw = ctx.message.text.trim();
+const text = normalizeTeamSlugInput(raw);
     const cid = state.chatId;
     const isPrivate = ctx.chat.type === "private";
     if (state.step === "new_team_slug") {
@@ -322,12 +336,81 @@ bot.on("new_chat_members", async (ctx) => {
   }
 });
 
+bot.on("message", async (ctx, next) => {
+  if (!isGroupChat(ctx)) return next();
+  const text = ctx.message?.text || ctx.message?.caption;
+  if (!text) return next();
+  const chatId = String(ctx.chat.id);
+  const commandInfo = parseTagCommand(text, chatId);
+  if (!commandInfo) return next();
+  const targetMessageId = getTargetMessageId(ctx, commandInfo);
+  if (!targetMessageId) {
+    await ctx.reply(
+      "Ответь (reply) на важное сообщение или добавь текст/фото/видео к команде — бот ответит на нужное сообщение."
+    );
+    return;
+  }
+  try {
+    const onlyAdmins = getTagallOnlyAdmins(chatId);
+    if (onlyAdmins) {
+      const ok = await isAdmin(ctx, ctx.from.id);
+      if (!ok) {
+        await ctx.reply("⛔️ Команда доступна только админам группы.");
+        return;
+      }
+    }
+    const waitSec = checkCooldown(chatId);
+    if (waitSec != null) {
+      await ctx.reply(`Подожди ещё ${waitSec} сек. перед следующим тегом.`);
+      return;
+    }
+    if (commandInfo.type === "tagall") {
+      const members = selectMembersStmt.all(chatId, MAX_USERS);
+      if (!members.length) {
+        await ctx.reply("Пока некого упоминать: я ещё не собрал базу участников.");
+        return;
+      }
+      setCooldown(chatId);
+      console.log(`tagall chat=${chatId} members=${members.length} chunks=${Math.ceil(members.length / CHUNK)}`);
+      await sendMentionChunks(ctx, chatId, targetMessageId, members, null);
+    } else {
+      const slug = commandInfo.slug;
+      const members = selectTeamMembersStmt.all(chatId, slug);
+      if (!members.length) {
+        await ctx.reply(`В команде /${slug} пока никого. Добавь участников через /admin → Подгруппы.`);
+        return;
+      }
+      setCooldown(chatId);
+      await sendMentionChunks(ctx, chatId, targetMessageId, members, slug);
+    }
+  } catch (e) {
+    const slug = commandInfo.type === "team" ? commandInfo.slug : "tagall";
+    console.error(`tag error /${slug}:`, e?.stack || e);
+    await ctx.reply("❌ Ошибка. Посмотри логи бота.").catch(() => {});
+  }
+});
+
 // -------------------- Commands --------------------
 bot.start(async (ctx) => {
   await ctx.reply(
-    "Я готов. Используй /tagall ответом (reply) на важное сообщение."
+    "Привет! Я бот для массовых упоминаний в группах.\n\n" +
+    "Как начать:\n" +
+    "1) Добавь меня в нужную группу и дай права администратора.\n" +
+    "2) Попроси участников написать в чат хотя бы 1 сообщение — только после этого я смогу их «увидеть» и добавить в базу.\n\n" +
+    "Основная команда:\n" +
+    "• /tagall — можно ответить (Reply) на сообщение или написать /tagall вместе с текстом/фото/видео. Я отвечу на нужное сообщение и упомяну участников пачками (по 20 в сообщении).\n\n" +
+    "Лимиты и защита:\n" +
+    "• максимум 100 упоминаний за один запуск\n" +
+    "• небольшая задержка между пачками\n" +
+    "• кулдаун между запусками, чтобы не спамили\n\n" +
+    "Подгруппы (команды):\n" +
+    "Админ может создать команду (например /friends) и добавить туда людей. Потом можно тегать только их: Reply на сообщение или текст/фото/видео + /friends.\n\n" +
+    "Настройки и управление:\n" +
+    "• /admin — меню админа (кто может тегать, подгруппы и т.д.)\n" +
+    "• /help — подсказки по командам"
   );
 });
+
 
 bot.command("ping", async (ctx) => {
   try {
@@ -968,6 +1051,35 @@ function teamLabelForMessage(slug) {
   return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
 }
 
+function parseTagCommand(text, chatId) {
+  if (!text || typeof text !== "string") return null;
+  const regex = /\/(tagall|[\w]+)(@\w+)?/gi;
+  const match = regex.exec(text);
+  if (!match) return null;
+  const cmd = match[1].toLowerCase();
+  if (cmd === "tagall") return { type: "tagall" };
+  const teamRow = getTeamSlugCaseInsensitiveStmt.get(String(chatId), cmd);
+  if (teamRow) return { type: "team", slug: teamRow.slug };
+  return null;
+}
+
+function messageHasExtraContent(ctx, commandStr) {
+  const msg = ctx.message;
+  if (msg.photo || msg.video || msg.document || msg.audio || msg.voice || msg.video_note || msg.sticker)
+    return true;
+  const text = msg.text || msg.caption || "";
+  const escaped = commandStr.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const withoutCommand = text.replace(new RegExp(`\\/${escaped}(@\\w+)?`, "gi"), "").trim();
+  return withoutCommand.length > 0;
+}
+
+function getTargetMessageId(ctx, commandInfo) {
+  if (ctx.message.reply_to_message) return ctx.message.reply_to_message.message_id;
+  const cmd = commandInfo.type === "tagall" ? "tagall" : commandInfo.slug;
+  if (messageHasExtraContent(ctx, cmd)) return ctx.message.message_id;
+  return null;
+}
+
 async function sendMentionChunks(ctx, chatId, targetMessageId, members, teamSlug = null) {
   const label = teamLabelForMessage(teamSlug);
   const suffix = `\n${escapeHtml(label)}, для вас важное сообщение!`;
@@ -997,92 +1109,6 @@ async function sendMentionChunks(ctx, chatId, targetMessageId, members, teamSlug
     if (i < chunks.length - 1) await sleep(DELAY_MS);
   }
 }
-
-bot.command("tagall", async (ctx) => {
-  try {
-    if (!isGroupChat(ctx)) {
-      return ctx.reply("Команда работает только в группах.");
-    }
-
-    const replied = ctx.message?.reply_to_message;
-    if (!replied) {
-      return ctx.reply("Использование: ответь (reply) на важное сообщение и напиши /tagall");
-    }
-
-    const chatId = ctx.chat.id;
-    const onlyAdmins = getTagallOnlyAdmins(chatId);
-    if (onlyAdmins) {
-      const ok = await isAdmin(ctx, ctx.from.id);
-      if (!ok) {
-        return ctx.reply("⛔️ Команда доступна только админам группы.");
-      }
-    }
-
-    const waitSec = checkCooldown(chatId);
-    if (waitSec != null) {
-      return ctx.reply(`Подожди ещё ${waitSec} сек. перед следующим /tagall.`);
-    }
-
-    const members = selectMembersStmt.all(String(chatId), MAX_USERS);
-
-    if (!members.length) {
-      return ctx.reply("Пока некого упоминать: я ещё не собрал базу участников.");
-    }
-
-    const targetMessageId = replied.message_id;
-    setCooldown(chatId);
-    console.log(`tagall chat=${chatId} members=${members.length} chunks=${Math.ceil(members.length / CHUNK)}`);
-    await sendMentionChunks(ctx, chatId, targetMessageId, members, null);
-  } catch (e) {
-    console.error("tagall error:", e?.stack || e);
-    return ctx.reply("❌ Ошибка при выполнении /tagall. Посмотри логи бота.");
-  }
-});
-
-// Custom team commands (e.g. /tagbar) — must run after other commands
-bot.on("message", async (ctx, next) => {
-  const text = ctx.message?.text;
-  if (!text || !text.startsWith("/")) return next();
-  const m = text.match(/^\/(\w+)(@\w+)?\s*$/);
-  if (!m) return next();
-  const cmd = m[1];
-  const known = ["tagall", "start", "admin", "ping", "newteam", "manage", "teams"];
-  if (known.includes(cmd.toLowerCase())) return next();
-  if (!isGroupChat(ctx)) return next();
-  const chatId = String(ctx.chat.id);
-  if (!getTeamStmt.get(chatId, cmd)) return next();
-
-  try {
-    const replied = ctx.message?.reply_to_message;
-    if (!replied) {
-      await ctx.reply(`Ответь (reply) на сообщение и напиши /${cmd}`);
-      return;
-    }
-    const onlyAdmins = getTagallOnlyAdmins(chatId);
-    if (onlyAdmins) {
-      const ok = await isAdmin(ctx, ctx.from.id);
-      if (!ok) {
-        await ctx.reply("⛔️ Команда доступна только админам группы.");
-        return;
-      }
-    }
-    const waitSec = checkCooldown(chatId);
-    if (waitSec != null) {
-      await ctx.reply(`Подожди ещё ${waitSec} сек. перед следующим тегом.`);
-      return;
-    }
-    const members = selectTeamMembersStmt.all(chatId, cmd);
-    if (!members.length) {
-      await ctx.reply(`В команде /${cmd} пока никого. Добавь участников через /admin → Подгруппы.`);
-      return;
-    }
-    setCooldown(chatId);
-    await sendMentionChunks(ctx, ctx.chat.id, replied.message_id, members, cmd);
-  } catch (e) {
-    console.error(`team tag /${cmd} error:`, e?.stack || e);
-    await ctx.reply("❌ Ошибка. Посмотри логи бота.").catch(() => {});
-  }
-});
 
 bot.command("teams", async (ctx) => {
   if (!isGroupChat(ctx)) return ctx.reply("Команда только для групп.");
