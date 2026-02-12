@@ -1087,16 +1087,19 @@ async function sendMentionChunks(ctx, chatId, targetMessageId, members, teamSlug
   for (let i = 0; i < members.length; i += CHUNK) {
     chunks.push(members.slice(i, i + CHUNK));
   }
+  const messageThreadId = ctx.message?.message_thread_id;
+  const extra = {
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    reply_parameters: { message_id: targetMessageId, allow_sending_without_reply: true }
+  };
+  if (messageThreadId) extra.message_thread_id = messageThreadId;
+
   for (let i = 0; i < chunks.length; i++) {
     const mentions = chunks[i].map(mentionHtml).join(MENTION_SEPARATOR);
     const text = mentions + suffix;
     try {
-      await ctx.telegram.sendMessage(chatId, text, {
-        parse_mode: "HTML",
-        disable_web_page_preview: true,
-        reply_to_message_id: targetMessageId,
-        allow_sending_without_reply: true
-      });
+      await ctx.telegram.sendMessage(chatId, text, extra);
     } catch (e) {
       const retryAfter = e?.parameters?.retry_after;
       if (retryAfter) {
