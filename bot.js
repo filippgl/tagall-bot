@@ -1074,9 +1074,9 @@ function messageHasExtraContent(ctx, commandStr) {
 }
 
 function getTargetMessageId(ctx, commandInfo) {
-  if (ctx.message.reply_to_message) return ctx.message.reply_to_message.message_id;
   const cmd = commandInfo.type === "tagall" ? "tagall" : commandInfo.slug;
   if (messageHasExtraContent(ctx, cmd)) return ctx.message.message_id;
+  if (ctx.message.reply_to_message) return ctx.message.reply_to_message.message_id;
   return null;
 }
 
